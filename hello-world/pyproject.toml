@@ -1,0 +1,12 @@
+[project]
+name = "hello-world-agent"
+version = "0.1.0"
+description = "Hello World demo using Claude Agent SDK in Python"
+requires-python = ">=3.10"
+dependencies = [
+    "claude-agent-sdk>=0.1.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
