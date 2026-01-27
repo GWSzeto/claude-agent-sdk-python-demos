@@ -1,0 +1,12 @@
+[project]
+name = "email-agent"
+version = "0.1.0"
+description = "AI-powered email management using Claude Agent SDK"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "claude-agent-sdk>=0.1.0",
+]
+
+[project.scripts]
+email-agent = "email_agent:main"
