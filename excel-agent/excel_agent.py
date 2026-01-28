@@ -118,15 +118,189 @@ async def read_spreadsheet(args):
             }]
         }
 
+@tool("edit_spreadsheet", "Edit cells in an existing spreadsheet", {
+    "filename": str,
+    "sheet_name": str,
+    "edits": list
+})
+async def edit_spreadsheet(args):
+    filename = args["filename"]
+    sheet_name = args.get("sheet_name")
+    edits = args["edits"]
+
+    if not Path(filename).exists():
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({"error": f"File not found: {filename}"})
+            }]
+        }
+
+    try:
+        wb = load_workbook(filename)
+        ws = wb[sheet_name] if sheet_name else wb.active
+
+        edited_cells = []
+        for edit in edits:
+            cell = edit["cell"]
+            value = edit["value"]
+            ws[cell] = value
+            edited_cells.append(cell)
+
+        wb.save(filename)
+
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({
+                    "status": "success",
+                    "filename": filename,
+                    "edited_cells": edited_cells,
+                    "edit_count": len(edited_cells),
+                }, indent=2)
+            }]
+        }
+    except Exception as e:
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({"error": str(e)})
+            }]
+        }
+
+
+@tool("add_formula", "Add Excel formulas to cells", {
+    "filename": str,
+    "sheet_name": str,
+    "formulas": list
+})
+async def add_formula(args):
+    filename = args["filename"]
+    sheet_name = args.get("sheet_name")
+    formulas = args["formulas"]
+
+    if not Path(filename).exists():
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({"error": f"File not found: {filename}"})
+            }]
+        }
+
+    try:
+        wb = load_workbook(filename)
+        ws = wb[sheet_name] if sheet_name else wb.active
+
+        added_formulas = []
+        for item in formulas:
+            cell = item["cell"]
+            formula = item["formula"]
+            # Ensure formula starts with =
+            if not formula.startswith("="):
+                formula = "=" + formula
+            ws[cell] = formula
+            added_formulas.append({"cell": cell, "formula": formula})
+
+        wb.save(filename)
+
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({
+                    "status": "success",
+                    "filename": filename,
+                    "formulas_added": added_formulas,
+                    "count": len(added_formulas),
+                }, indent=2)
+            }]
+        }
+    except Exception as e:
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({"error": str(e)})
+            }]
+        }
+
+
+@tool("get_spreadsheet_info", "Get metadata about a spreadsheet", {
+    "filename": str
+})
+async def get_spreadsheet_info(args):
+    filename = args["filename"]
+
+    if not Path(filename).exists():
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({"error": f"File not found: {filename}"})
+            }]
+        }
+
+    try:
+        wb = load_workbook(filename)
+
+        sheets_info = []
+        total_formulas = 0
+
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            formula_count = 0
+            row_count = ws.max_row or 0
+            col_count = ws.max_column or 0
+
+            # Count formulas
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value and isinstance(cell.value, str) and cell.value.startswith("="):
+                        formula_count += 1
+
+            total_formulas += formula_count
+            sheets_info.append({
+                "name": sheet_name,
+                "rows": row_count,
+                "columns": col_count,
+                "formula_count": formula_count,
+            })
+
+        wb.close()
+
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({
+                    "filename": filename,
+                    "sheet_count": len(sheets_info),
+                    "total_formulas": total_formulas,
+                    "sheets": sheets_info,
+                }, indent=2)
+            }]
+        }
+    except Exception as e:
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({"error": str(e)})
+            }]
+        }
+
+
+
 excel_tools = create_sdk_mcp_server(
     name="excel",
     version="1.0.0",
-    tools=[create_spreadsheet, read_spreadsheet]
+    tools=[create_spreadsheet, read_spreadsheet, edit_spreadsheet, add_formula, get_spreadsheet_info]
 )
 
 options = ClaudeAgentOptions(
     mcp_servers={"excel": excel_tools},
-    allowed_tools=["mcp__excel__create_spreadsheet", "mcp__excel__read_spreadsheet"],
+    allowed_tools=[
+        "mcp__excel__create_spreadsheet",
+        "mcp__excel__read_spreadsheet",
+        "mcp__excel__edit_spreadsheet",
+        "mcp__excel__add_formula",
+        "mcp__excel__get_spreadsheet_info",
+    ],
 )
 
 async def main():
