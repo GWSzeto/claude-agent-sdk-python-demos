@@ -591,6 +591,270 @@ python email_agent.py --triage -v
 
 ---
 
+## Iteration 6: Subagents for Specialized Email Handling (Orchestrator-Workers Pattern)
+
+**Goal**: Use subagents with the orchestrator-workers pattern for parallel, specialized email processing.
+
+**Background**: The orchestrator-workers pattern from Anthropic's building effective agents research employs a central LLM that dynamically breaks down tasks, delegates to worker LLMs, and synthesizes results. This is ideal for email processing where different email types require specialized handling.
+
+**Pattern Flow**:
+```
+                              ┌→ triage-agent (prioritization) ──┐
+User: "Process my inbox" → Orchestrator ┼→ support-agent (tickets) ────┼→ Orchestrator → Summary
+                              └→ newsletter-agent (archival) ────┘
+```
+
+**Benefits**:
+- **Context Isolation**: Each subagent focuses on its domain without context pollution
+- **Parallelization**: Multiple analyses run concurrently
+- **Specialized Instructions**: Each agent has tailored prompts and tool access
+- **Tool Restrictions**: Support agent can't archive; newsletter agent can't label as urgent
+
+**Requirements**:
+- Define 3 subagents using `AgentDefinition`
+- Configure tool restrictions for each subagent
+- Use `Task` tool to enable subagent invocation
+- Implement orchestration logic in the main prompt
+
+**Subagent Definitions**:
+```python
+from claude_agent_sdk import ClaudeAgentOptions, AgentDefinition
+
+options = ClaudeAgentOptions(
+    mcp_servers={"email": email_tools},
+    allowed_tools=[
+        "mcp__email__search_inbox",
+        "mcp__email__read_emails",
+        "mcp__email__archive_emails",
+        "mcp__email__label_emails",
+        "mcp__email__get_email_stats",
+        "Skill",
+        "Task"  # Required for subagent invocation
+    ],
+    setting_sources=["project"],
+    agents={
+        "triage-agent": AgentDefinition(
+            description="Email prioritization specialist. Use for inbox triage, urgency detection, and priority labeling.",
+            prompt="""You are an email triage specialist. Your job is to:
+1. Identify urgent and high-priority emails
+2. Classify emails by urgency: P0 (critical), P1 (high), P2 (medium), P3 (low)
+3. Label emails appropriately using the label_emails tool
+
+Priority Criteria:
+- P0: Keywords "urgent", "critical", "production down", "ASAP"; from executives
+- P1: Customer support without urgent keywords; overdue invoices; P0/P1 bug reports
+- P2: Internal communications; meeting requests
+- P3: Newsletters; marketing; FYI emails
+
+Always search first, then label based on findings.""",
+            tools=[
+                "mcp__email__search_inbox",
+                "mcp__email__read_emails",
+                "mcp__email__label_emails"
+            ],
+            model="sonnet"
+        ),
+
+        "support-agent": AgentDefinition(
+            description="Customer support email handler. Use for support tickets, bug reports, and customer issues.",
+            prompt="""You are a customer support email specialist. Your job is to:
+1. Identify and categorize support tickets
+2. Detect urgency based on keywords and customer type
+3. Label tickets appropriately for follow-up
+4. Summarize open issues
+
+Urgency Detection:
+- Keywords: "urgent", "critical", "down", "broken", "not working", "production"
+- Enterprise customers (check for "enterprise" label)
+- Bug reports marked P0 or P1
+
+Label Convention:
+- urgent: Needs immediate attention
+- enterprise: From enterprise customer
+- bug-report: Technical issue
+- billing: Payment/invoice related
+
+Never archive support emails - only search, read, and label.""",
+            tools=[
+                "mcp__email__search_inbox",
+                "mcp__email__read_emails",
+                "mcp__email__label_emails"
+            ],
+            model="sonnet"
+        ),
+
+        "newsletter-agent": AgentDefinition(
+            description="Newsletter management specialist. Use for newsletter organization, archival, and subscription management.",
+            prompt="""You are a newsletter management specialist. Your job is to:
+1. Identify newsletters from common sources
+2. Archive old newsletters (older than 30 days by default)
+3. Never archive starred or important-labeled newsletters
+4. Report archival statistics
+
+Newsletter Sources to Identify:
+- techcrunch.com, morningbrew.com, hackernews.com
+- substack.com, medium.com
+- Any email with "newsletter", "digest", "weekly" in subject
+
+Archival Rules:
+- Archive if older than threshold (default 30 days)
+- Skip if starred or has "important" label
+- Report count of archived vs skipped
+
+You can only search and archive - do not label newsletters as urgent.""",
+            tools=[
+                "mcp__email__search_inbox",
+                "mcp__email__read_emails",
+                "mcp__email__archive_emails"
+            ],
+            model="haiku"  # Simpler model for straightforward task
+        )
+    }
+)
+```
+
+**Orchestration Prompt**:
+```python
+ORCHESTRATOR_PROMPT = """You are an email management orchestrator. Based on the user's request,
+delegate to specialized subagents:
+
+Available Subagents:
+1. triage-agent: For inbox prioritization and urgency detection
+2. support-agent: For customer support tickets and bug reports
+3. newsletter-agent: For newsletter archival and management
+
+Delegation Strategy:
+- For "triage" or "prioritize" requests → use triage-agent
+- For "support" or "tickets" or "bugs" requests → use support-agent
+- For "newsletters" or "archive" requests → use newsletter-agent
+- For comprehensive inbox processing → use multiple agents in parallel
+
+After receiving results from subagents, synthesize a unified summary for the user.
+
+Example delegation:
+- "Process my inbox" → Run all three agents, combine results
+- "Handle urgent emails" → Use triage-agent only
+- "Clean up newsletters" → Use newsletter-agent only
+"""
+```
+
+**Parallel Execution Example**:
+```python
+async def process_inbox_comprehensive(verbose: bool = False) -> None:
+    """Run all subagents in parallel for comprehensive inbox processing."""
+
+    prompt = """Process my entire inbox comprehensively:
+
+1. Use the triage-agent to identify and label urgent/priority emails
+2. Use the support-agent to categorize customer support tickets
+3. Use the newsletter-agent to archive old newsletters
+
+Run these analyses in parallel where possible, then provide a unified summary including:
+- Number of urgent emails found and labeled
+- Open support tickets by category
+- Newsletters archived vs kept
+- Recommended actions for me to take
+"""
+
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(prompt)
+
+        async for message in client.receive_response():
+            # Detect subagent invocations
+            if hasattr(message, 'content') and message.content:
+                for block in message.content:
+                    if getattr(block, 'type', None) == 'tool_use' and block.name == 'Task':
+                        subagent = block.input.get('subagent_type', 'unknown')
+                        if verbose:
+                            print(f"[SUBAGENT] Delegating to: {subagent}")
+
+            # Check if inside subagent context
+            if hasattr(message, 'parent_tool_use_id') and message.parent_tool_use_id:
+                if verbose:
+                    print("  (executing in subagent)")
+
+            if hasattr(message, "result"):
+                print(message.result)
+```
+
+**CLI Integration**:
+```python
+cli = AgentCLI(
+    name="Email Agent",
+    description="AI-powered email management with specialized subagents",
+    arguments=[
+        # ... existing arguments ...
+        CLIArgument(
+            name="--process-all",
+            short="-p",
+            help="Run comprehensive inbox processing with all subagents",
+            action="store_true"
+        ),
+        CLIArgument(
+            name="--agent",
+            short="-a",
+            help="Use specific subagent: triage, support, or newsletter",
+            choices=["triage", "support", "newsletter"]
+        ),
+    ]
+)
+```
+
+**Usage Examples**:
+```bash
+# Comprehensive processing with all subagents
+python email_agent.py --process-all
+
+# Use specific subagent
+python email_agent.py --agent triage -q "Find urgent emails"
+python email_agent.py --agent support -q "Summarize open tickets"
+python email_agent.py --agent newsletter -q "Archive newsletters older than 14 days"
+
+# Verbose mode to see subagent delegation
+python email_agent.py --process-all -v
+```
+
+**Expected Output**:
+```
+[SUBAGENT] Delegating to: triage-agent
+  (executing in subagent)
+[SUBAGENT] Delegating to: support-agent
+  (executing in subagent)
+[SUBAGENT] Delegating to: newsletter-agent
+  (executing in subagent)
+
+[ASSISTANT] Inbox Processing Complete:
+
+## Priority Emails (triage-agent)
+- 2 P0 Critical: Production issues from ACME Corp and Enterprise customer
+- 3 P1 High: Overdue invoice, 2 bug reports
+- 5 P2 Medium: Internal communications
+
+## Support Tickets (support-agent)
+- 4 open tickets identified
+- 2 labeled as urgent (enterprise customers)
+- 1 bug report escalated to engineering
+
+## Newsletter Management (newsletter-agent)
+- 6 newsletters archived (older than 30 days)
+- 2 kept (starred or important)
+
+## Recommended Actions
+1. Respond to ACME Corp production issue immediately
+2. Review 2 urgent support tickets
+3. Approve overdue invoice payment
+```
+
+**Key Concepts Tested**:
+- Orchestrator-Workers pattern from building effective agents
+- Subagent definition with `AgentDefinition`
+- Tool restrictions per subagent
+- Parallel subagent execution
+- Context isolation between specialized agents
+- Model selection per subagent (sonnet vs haiku based on task complexity)
+
+---
+
 ## Comparison Checklist
 
 | Feature | TypeScript Demo | Python Implementation |
@@ -623,6 +887,23 @@ python email_agent.py --triage -v
 | `email-triage` | Prioritize and organize emails | triage, prioritize, organize, urgent |
 | `newsletter-management` | Handle newsletter subscriptions | newsletters, archive, subscriptions |
 | `support-response` | Handle customer support emails | support, tickets, bug reports, customer |
+
+## Subagents Summary (Iteration 6)
+
+| Subagent | Purpose | Tools Access | Model |
+|----------|---------|--------------|-------|
+| `triage-agent` | Email prioritization and urgency detection | search, read, label | sonnet |
+| `support-agent` | Customer support ticket handling | search, read, label | sonnet |
+| `newsletter-agent` | Newsletter archival and management | search, read, archive | haiku |
+
+## Patterns Used
+
+| Pattern | Iteration | Description |
+|---------|-----------|-------------|
+| Augmented LLM | 1-3 | Tools + Mock data foundation |
+| Skills (Domain Knowledge) | 4 | Filesystem-based specialized instructions |
+| Routing | 4-5 | Skills route to specialized workflows |
+| Orchestrator-Workers | 6 | Subagents with parallel execution |
 
 ## Mock Data Categories
 
