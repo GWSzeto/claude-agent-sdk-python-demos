@@ -1,3 +1,4 @@
+from pathlib import Path
 from claude_agent_sdk import AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, ResultMessage, TextBlock, ToolUseBlock, create_sdk_mcp_server, tool
 import asyncio
 import json
@@ -73,13 +74,16 @@ options = ClaudeAgentOptions(
             "mcp__email__archive_emails", 
             "mcp__email__label_emails", 
             "mcp__email__get_email_stats",
-            "mcp__email__send_email"
+            "mcp__email__send_email",
+            "Skill"
         ],
+    setting_sources=["project"],
+    cwd=str(Path(__file__).parent)
 )
 
 async def main():
     async with ClaudeSDKClient(options=options) as client:
-        await client.query("Give me stats about my inbox")
+        await client.query("Triage my inbox and identify urgent emails")
 
         async for message in client.receive_response():
             if isinstance(message, AssistantMessage):
