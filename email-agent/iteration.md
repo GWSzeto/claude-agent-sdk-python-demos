@@ -255,92 +255,199 @@ async def get_email_stats(args: dict) -> dict:
 
 ---
 
-## Iteration 4: Action Templates
+## Iteration 4: Agent Skills for Email Workflows
 
-**Goal**: Implement pre-defined action templates that users can execute.
+**Goal**: Create Agent Skills to provide domain-specific email management expertise.
+
+**Background**: Agent Skills are filesystem-based capabilities that extend Claude with specialized knowledge. Unlike MCP tools (which execute code), Skills provide instructions, workflows, and best practices that Claude follows autonomously.
 
 **Requirements**:
-- Create action template system for common email workflows
-- Implement 3 action templates from the TypeScript demo:
-  1. Archive old newsletters
-  2. Summarize CEO updates
-  3. Label urgent customer support emails
-- Actions should be invokable by name with parameters
+- Create 3 Skills in `.claude/skills/` directory:
+  1. `email-triage` - Guidelines for prioritizing and organizing emails
+  2. `newsletter-management` - Workflow for handling newsletter subscriptions
+  3. `support-response` - Best practices for handling customer support emails
+- Each Skill needs a `SKILL.md` file with YAML frontmatter
+- Configure `setting_sources` to load Skills from the project
 
-**Action Template Structure**:
-```python
-@dataclass
-class ActionTemplate:
-    id: str
-    name: str
-    description: str
-    parameters: dict[str, Any]  # Parameter definitions with defaults
-    prompt_template: str         # Prompt to send to agent
-
-ACTION_TEMPLATES = {
-    "archive_old_newsletters": ActionTemplate(
-        id="archive_old_newsletters",
-        name="Archive Old Newsletters",
-        description="Archive newsletter emails older than N days",
-        parameters={"days_old": {"type": int, "default": 30}},
-        prompt_template="Search for newsletter emails older than {days_old} days and archive them."
-    ),
-    "summarize_ceo_updates": ActionTemplate(
-        id="summarize_ceo_updates",
-        name="Summarize CEO Updates",
-        description="Generate a summary of CEO weekly update emails",
-        parameters={"weeks_back": {"type": int, "default": 4}},
-        prompt_template="Find CEO update emails from the past {weeks_back} weeks and provide a summary."
-    ),
-    "label_urgent_support": ActionTemplate(
-        id="label_urgent_support",
-        name="Label Urgent Support Emails",
-        description="Label urgent customer support emails",
-        parameters={"hours_back": {"type": int, "default": 24}},
-        prompt_template="Find customer support emails from the last {hours_back} hours containing urgent keywords and label them as 'urgent'."
-    )
-}
+**Skill Directory Structure**:
+```
+email-agent/
+├── .claude/
+│   └── skills/
+│       ├── email-triage/
+│       │   └── SKILL.md
+│       ├── newsletter-management/
+│       │   └── SKILL.md
+│       └── support-response/
+│           └── SKILL.md
+├── email_agent.py
+├── mock_data.py
+└── ...
 ```
 
-**MCP Tool for Actions**:
+**Skill 1: email-triage/SKILL.md**:
+```yaml
+---
+name: email-triage
+description: Guidelines for prioritizing and organizing emails. Use when asked to triage, prioritize, or organize an inbox.
+---
+
+# Email Triage Skill
+
+## Priority Levels
+
+Assign emails to priority levels based on these criteria:
+
+### P0 - Critical (Immediate Action)
+- Keywords: "urgent", "critical", "production down", "ASAP", "emergency"
+- From: CEO, CTO, or executive leadership
+- Customer support with "enterprise" label
+
+### P1 - High (Same Day)
+- Customer support tickets without urgent keywords
+- Invoices marked overdue
+- Bug reports with "P0" or "P1" priority
+
+### P2 - Medium (This Week)
+- Internal team communications
+- Meeting requests
+- Non-urgent customer inquiries
+
+### P3 - Low (When Available)
+- Newsletters
+- Marketing emails
+- FYI/informational emails
+
+## Triage Workflow
+
+1. Search for unread emails: `is:unread`
+2. Identify P0/P1 emails first using keyword search
+3. Label appropriately: "priority-critical", "priority-high", etc.
+4. Summarize findings for the user
+
+## Example Queries
+
+- Find urgent emails: `is:unread subject:urgent OR subject:critical`
+- Find executive emails: `from:ceo OR from:cto`
+- Find overdue invoices: `subject:overdue OR subject:invoice`
+```
+
+**Skill 2: newsletter-management/SKILL.md**:
+```yaml
+---
+name: newsletter-management
+description: Workflow for managing newsletter subscriptions and archiving old newsletters. Use when asked about newsletters, subscriptions, or archiving marketing emails.
+---
+
+# Newsletter Management Skill
+
+## Newsletter Sources
+
+Common newsletter senders to identify:
+- techcrunch.com
+- morningbrew.com
+- hackernews.com
+- substack.com
+- Medium digests
+
+## Archival Policy
+
+- Archive newsletters older than 30 days by default
+- Never archive newsletters with "important" label
+- Keep newsletters that were starred
+
+## Management Workflow
+
+1. Search for newsletters: `label:newsletter`
+2. Identify old newsletters: `label:newsletter older_than:30d`
+3. Archive in batches using `archive_emails` tool
+4. Report count of archived emails
+
+## Query Patterns
+
+- All newsletters: `label:newsletter`
+- Old newsletters: `label:newsletter older_than:30d`
+- Specific source: `from:techcrunch.com`
+```
+
+**Skill 3: support-response/SKILL.md**:
+```yaml
+---
+name: support-response
+description: Best practices for handling customer support emails and bug reports. Use when dealing with support tickets, bug reports, or customer issues.
+---
+
+# Customer Support Response Skill
+
+## Urgency Detection
+
+Identify urgent support emails by:
+- Keywords: "urgent", "critical", "down", "broken", "not working", "production"
+- Enterprise customers (check for "enterprise" label)
+- Bug reports marked P0 or P1
+
+## Response Priority
+
+1. **Production issues**: Acknowledge within 1 hour
+2. **Enterprise customers**: Acknowledge within 4 hours
+3. **Bug reports**: Triage within 24 hours
+4. **General inquiries**: Respond within 48 hours
+
+## Labeling Convention
+
+- `urgent` - Needs immediate attention
+- `enterprise` - From enterprise customer
+- `bug-report` - Technical issue reported
+- `billing` - Payment/invoice related
+
+## Workflow
+
+1. Search recent support emails: `to:support newer_than:1d`
+2. Identify urgent issues with keyword search
+3. Label appropriately using `label_emails` tool
+4. Summarize open tickets for review
+
+## Escalation Criteria
+
+Escalate to engineering if:
+- "data loss" mentioned
+- Multiple customers report same issue
+- Production environment affected
+```
+
+**Agent Configuration with Skills**:
 ```python
-@tool("execute_action", "Execute a pre-defined email action template", {
-    "action_id": str,
-    "parameters": dict  # Override default parameters
-})
-async def execute_action(args: dict) -> dict:
-    action_id = args["action_id"]
-    params = args.get("parameters", {})
+from claude_agent_sdk import ClaudeSDKClient, ClaudeAgentOptions
 
-    template = ACTION_TEMPLATES.get(action_id)
-    if not template:
-        return {"content": [{"type": "text", "text": f"Unknown action: {action_id}"}]}
-
-    # Merge defaults with provided params
-    final_params = {**template.parameters_defaults, **params}
-    prompt = template.prompt_template.format(**final_params)
-
-    return {"content": [{"type": "text", "text": f"Executing: {prompt}"}]}
-
-@tool("list_actions", "List all available action templates", {})
-async def list_actions(args: dict) -> dict:
-    actions = [{"id": a.id, "name": a.name, "description": a.description}
-               for a in ACTION_TEMPLATES.values()]
-    return {"content": [{"type": "text", "text": json.dumps(actions, indent=2)}]}
+options = ClaudeAgentOptions(
+    mcp_servers={"email": email_tools},
+    allowed_tools=[
+        "mcp__email__search_inbox",
+        "mcp__email__read_emails",
+        "mcp__email__send_email",
+        "mcp__email__archive_emails",
+        "mcp__email__label_emails",
+        "mcp__email__get_email_stats",
+        "Skill"  # Enable Skills
+    ],
+    setting_sources=["project"],  # Load Skills from .claude/skills/
+    cwd="/path/to/email-agent"     # Project directory
+)
 ```
 
 **Test Prompts**:
 ```
-"What actions are available?"
-"Execute the archive_old_newsletters action"
-"Run the summarize_ceo_updates action for the last 2 weeks"
-"Label urgent support emails from the last 12 hours"
+"Triage my inbox and identify urgent emails"
+"Archive old newsletters from the past month"
+"Help me handle the customer support tickets"
+"What skills are available for email management?"
 ```
 
 **Key Concepts Tested**:
-- Template-based workflows
-- Parameter merging and defaults
-- Dynamic prompt generation
+- Skill creation with SKILL.md and YAML frontmatter
+- `setting_sources` configuration for Skill discovery
+- Combining MCP tools with Skills
+- Domain-specific workflows and best practices
 
 ---
 
@@ -350,93 +457,137 @@ async def list_actions(args: dict) -> dict:
 
 **Requirements**:
 - PreToolUse hook to log all email operations
-- PostToolUse hook to track action statistics
+- Integrate Skills with CLI workflow
 - CLI using shared `AgentCLI` module
-- Interactive and single-command modes
+- Support for direct queries and skill-based workflows
 
-**Hook Implementations**:
+**Hook Implementation**:
 ```python
-# Track statistics across the session
-session_stats = {"searches": 0, "emails_read": 0, "emails_archived": 0, "emails_labeled": 0}
+from typing import Any
+from claude_agent_sdk import HookContext
 
-async def log_email_operation(input_data: dict, tool_use_id: str | None, context: HookContext) -> dict:
-    """Log all email tool operations."""
+async def log_email_operation(
+    input_data: dict[str, Any],
+    tool_use_id: str | None,
+    context: HookContext
+) -> dict[str, Any]:
+    """Log all email and skill operations."""
     tool_name = input_data.get('tool_name', 'unknown')
-    print(f"[EMAIL-OP] {tool_name}")
-    return {}
 
-async def track_statistics(output_data: dict, tool_use_id: str | None, context: HookContext) -> dict:
-    """Track usage statistics after tool execution."""
-    tool_name = output_data.get('tool_name', 'unknown')
-    if tool_name == 'search_inbox':
-        session_stats['searches'] += 1
-    elif tool_name == 'read_emails':
-        session_stats['emails_read'] += 1
-    # ... etc
+    # Log MCP tool usage
+    if tool_name.startswith('mcp__email__'):
+        operation = tool_name.replace('mcp__email__', '')
+        print(f"[EMAIL-OP] {operation}")
+
+    # Log Skill invocation
+    elif tool_name == 'Skill':
+        skill_name = input_data.get('tool_input', {}).get('skill', 'unknown')
+        print(f"[SKILL] Invoking: {skill_name}")
+
     return {}
 ```
 
 **CLI Configuration**:
 ```python
+from shared.cli import AgentCLI, CLIArgument
+
 cli = AgentCLI(
     name="Email Agent",
-    description="AI-powered email management using Claude Agent SDK",
+    description="AI-powered email management using Claude Agent SDK with Skills",
     arguments=[
         CLIArgument(
             name="--query",
             short="-q",
-            help="Direct query to execute (e.g., 'Find unread emails from CEO')"
+            help="Direct query to execute (e.g., 'Find unread emails')"
         ),
         CLIArgument(
-            name="--action",
-            short="-a",
-            help="Execute a pre-defined action (e.g., 'archive_old_newsletters')"
-        ),
-        CLIArgument(
-            name="--interactive",
-            short="-i",
-            help="Run in interactive mode",
+            name="--triage",
+            short="-t",
+            help="Run email triage workflow",
             action="store_true"
+        ),
+        CLIArgument(
+            name="--archive-newsletters",
+            help="Archive newsletters older than N days",
+            arg_type=int,
+            default=30
         ),
         CLIArgument(
             name="--verbose",
             short="-v",
-            help="Show detailed tool usage",
-            action="store_true"
-        ),
-        CLIArgument(
-            name="--stats",
-            short="-s",
-            help="Show session statistics at end",
+            help="Show detailed tool and skill usage",
             action="store_true"
         ),
     ]
 )
 ```
 
+**Main Function**:
+```python
+async def run_agent(args) -> int:
+    options = ClaudeAgentOptions(
+        mcp_servers={"email": email_tools},
+        allowed_tools=[
+            "mcp__email__search_inbox",
+            "mcp__email__read_emails",
+            "mcp__email__archive_emails",
+            "mcp__email__label_emails",
+            "mcp__email__get_email_stats",
+            "Skill"
+        ],
+        setting_sources=["project"],
+        cwd=str(Path(__file__).parent),
+        hooks={
+            'PreToolUse': [HookMatcher(hooks=[log_email_operation])]
+        } if args.verbose else {}
+    )
+
+    # Determine prompt based on CLI args
+    if args.triage:
+        prompt = "Triage my inbox. Identify urgent emails and prioritize them."
+    elif args.archive_newsletters:
+        prompt = f"Archive newsletters older than {args.archive_newsletters} days."
+    elif args.query:
+        prompt = args.query
+    else:
+        prompt = "Give me a summary of my inbox."
+
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(prompt)
+        # ... handle response
+```
+
 **Usage Examples**:
 ```bash
 # Direct query
-python email_agent.py -q "Find all unread emails and summarize them"
+python email_agent.py -q "Find all unread emails from the CEO"
 
-# Execute action
-python email_agent.py -a archive_old_newsletters
+# Triage workflow (uses email-triage Skill)
+python email_agent.py --triage
 
-# Execute action with parameters
-python email_agent.py -a summarize_ceo_updates --params '{"weeks_back": 2}'
+# Archive newsletters (uses newsletter-management Skill)
+python email_agent.py --archive-newsletters 30
 
-# Interactive mode
-python email_agent.py -i
+# Verbose mode to see Skill invocations
+python email_agent.py --triage -v
+```
 
-# With statistics
-python email_agent.py -q "Archive newsletters" --stats
+**Expected Output with Verbose**:
+```
+[SKILL] Invoking: email-triage
+[EMAIL-OP] search_inbox
+[EMAIL-OP] label_emails
+[ASSISTANT] I've triaged your inbox. Found 3 urgent emails:
+- P0: "URGENT: Production system down" from john.doe@acmecorp.com
+- P1: "Critical Bug: Data loss on form submission" from user@enterprise.com
+- P1: "Critical: Data export not working" from alex.wong@startup.co
 ```
 
 **Key Concepts Tested**:
-- PreToolUse and PostToolUse hooks
-- Session state management
-- Shared CLI integration
-- Multiple execution modes
+- Skills integration with hooks
+- `setting_sources` for project-level Skills
+- Combining MCP tools with Skill-based workflows
+- CLI shortcuts for common Skill workflows
 
 ---
 
@@ -449,7 +600,7 @@ python email_agent.py -q "Archive newsletters" --stats
 | Send Email | Full IMAP send | `send_email` tool (mock) |
 | Archive | Gmail API | `archive_emails` tool (mock) |
 | Labels | Gmail labels | `label_emails` tool (mock) |
-| Actions | 5 templates | 3 templates (subset) |
+| Actions | 5 templates (code-based) | 3 Skills (filesystem-based) |
 | Listeners | 6 event types | Hooks (simplified) |
 | UI | React frontend | CLI |
 | Backend | Express + WebSocket | None (direct SDK) |
@@ -464,8 +615,14 @@ python email_agent.py -q "Archive newsletters" --stats
 | `archive_emails` | Archive emails | **NEW** (mock) |
 | `label_emails` | Manage email labels | **NEW** (mock) |
 | `get_email_stats` | Inbox statistics | **NEW** |
-| `execute_action` | Run action templates | **NEW** |
-| `list_actions` | List available actions | **NEW** |
+
+## Skills Summary
+
+| Skill | Purpose | Trigger Keywords |
+|-------|---------|------------------|
+| `email-triage` | Prioritize and organize emails | triage, prioritize, organize, urgent |
+| `newsletter-management` | Handle newsletter subscriptions | newsletters, archive, subscriptions |
+| `support-response` | Handle customer support emails | support, tickets, bug reports, customer |
 
 ## Mock Data Categories
 

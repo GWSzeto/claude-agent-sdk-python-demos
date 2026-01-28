@@ -158,8 +158,9 @@ cython_debug/
 ehthumbs.db
 Thumbs.db
 
-# Claude
-.claude/
+# Claude (ignore settings, but keep skills for sharing)
+.claude/*
+!.claude/skills/
 
 # Generated resume files
 *.docx
