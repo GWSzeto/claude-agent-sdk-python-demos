@@ -1,12 +1,18 @@
-from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, AssistantMessage, TextBlock, ResultMessage, create_sdk_mcp_server, tool
-import asyncio
-import json
+import sys
 from pathlib import Path
+
+# Add shared module to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, AssistantMessage, TextBlock, ResultMessage, create_sdk_mcp_server, tool, HookMatcher
+import json
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
 from openpyxl.styles import Font, PatternFill, Alignment
 import pandas as pd
+
+from shared.cli import AgentCLI, CLIArgument, run_agent_cli
 
 @tool("create_spreadsheet", "Create a new Excel spreadsheet with data", {
     "filename": str,
@@ -392,38 +398,280 @@ async def format_cells(args):
         }
 
 
+@tool("evaluate_spreadsheet", "Evaluate spreadsheet quality against best practices", {"filename": str})
+async def evaluate_spreadsheet(args: dict) -> dict:
+    filename = args["filename"]
+
+    if not Path(filename).exists():
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({"error": f"File not found: {filename}"})
+            }]
+        }
+
+    try:
+        wb = load_workbook(filename)
+
+        score = 0
+        issues = []
+        suggestions = []
+
+        # Excel error types to check
+        excel_errors = ['#VALUE!', '#DIV/0!', '#REF!', '#NAME?', '#NULL!', '#NUM!', '#N/A']
+
+        total_cells = 0
+        formula_cells = 0
+        error_cells = []
+        empty_data_cells = []
+        formatted_headers = 0
+        total_headers = 0
+
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            max_row = ws.max_row or 0
+            max_col = ws.max_column or 0
+
+            if max_row == 0 or max_col == 0:
+                continue
+
+            # Check header row (row 1)
+            for col in range(1, max_col + 1):
+                cell = ws.cell(row=1, column=col)
+                if cell.value:
+                    total_headers += 1
+                    # Check if header is formatted (bold or has fill)
+                    if cell.font.bold or (cell.fill.start_color.rgb and cell.fill.start_color.rgb != '00000000'):
+                        formatted_headers += 1
+
+            # Check data cells
+            for row in range(2, max_row + 1):
+                for col in range(1, max_col + 1):
+                    cell = ws.cell(row=row, column=col)
+                    total_cells += 1
+
+                    # Check for formulas
+                    if cell.value and isinstance(cell.value, str) and cell.value.startswith('='):
+                        formula_cells += 1
+
+                    # Check for Excel errors (need to load with data_only=True for this)
+                    if cell.value and isinstance(cell.value, str):
+                        for err in excel_errors:
+                            if err in str(cell.value):
+                                error_cells.append(f"{sheet_name}!{cell.coordinate}: {err}")
+                                break
+
+                    # Check for empty cells in data range
+                    if cell.value is None:
+                        empty_data_cells.append(f"{sheet_name}!{cell.coordinate}")
+
+        wb.close()
+
+        # Also check with data_only to find formula errors
+        wb_data = load_workbook(filename, data_only=True)
+        for sheet_name in wb_data.sheetnames:
+            ws = wb_data[sheet_name]
+            for row in ws.iter_rows():
+                for cell in row:
+                    if cell.value and isinstance(cell.value, str):
+                        for err in excel_errors:
+                            if err in str(cell.value):
+                                loc = f"{sheet_name}!{cell.coordinate}: {err}"
+                                if loc not in error_cells:
+                                    error_cells.append(loc)
+        wb_data.close()
+
+        # Scoring
+        # 1. Formula errors (30 points) - 0 tolerance
+        if len(error_cells) == 0:
+            score += 30
+        else:
+            issues.append(f"Found {len(error_cells)} formula error(s)")
+            for err in error_cells[:5]:  # Show first 5
+                issues.append(f"  - {err}")
+            suggestions.append("Fix all formula errors before finalizing")
+
+        # 2. Formula usage (25 points)
+        if total_cells > 0:
+            formula_ratio = formula_cells / total_cells
+            if formula_ratio >= 0.1:  # At least 10% formulas
+                score += 25
+            elif formula_ratio >= 0.05:
+                score += 15
+                suggestions.append("Consider using more formulas instead of hardcoded values")
+            else:
+                score += 5
+                issues.append("Very few formulas used - mostly hardcoded values")
+                suggestions.append("Use Excel formulas for calculations to make spreadsheet dynamic")
+        else:
+            score += 25  # Empty spreadsheet gets full points here
+
+        # 3. Header formatting (25 points)
+        if total_headers > 0:
+            header_ratio = formatted_headers / total_headers
+            if header_ratio >= 0.8:
+                score += 25
+            elif header_ratio >= 0.5:
+                score += 15
+                suggestions.append("Format remaining headers with bold or background color")
+            else:
+                score += 5
+                issues.append("Headers are not properly formatted")
+                suggestions.append("Apply bold text and/or yellow background to header row")
+        else:
+            issues.append("No headers found")
+            suggestions.append("Add descriptive column headers to row 1")
+
+        # 4. Data completeness (20 points)
+        if total_cells > 0:
+            empty_ratio = len(empty_data_cells) / total_cells
+            if empty_ratio <= 0.05:  # Less than 5% empty
+                score += 20
+            elif empty_ratio <= 0.15:
+                score += 10
+                suggestions.append("Some data cells are empty - verify if intentional")
+            else:
+                issues.append(f"{len(empty_data_cells)} empty cells in data range")
+                suggestions.append("Fill in missing data or remove empty rows/columns")
+        else:
+            score += 20  # Empty spreadsheet
+
+        passing = score >= 75
+
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({
+                    "score": score,
+                    "max_score": 100,
+                    "passing": passing,
+                    "breakdown": {
+                        "formula_errors": 30 if len(error_cells) == 0 else 0,
+                        "formula_usage": min(25, score - (30 if len(error_cells) == 0 else 0)),
+                        "header_formatting": formatted_headers,
+                        "data_completeness": 20 if total_cells == 0 or len(empty_data_cells) / total_cells <= 0.05 else 0,
+                    },
+                    "stats": {
+                        "total_cells": total_cells,
+                        "formula_cells": formula_cells,
+                        "error_count": len(error_cells),
+                        "empty_cells": len(empty_data_cells),
+                        "formatted_headers": formatted_headers,
+                        "total_headers": total_headers,
+                    },
+                    "issues": issues,
+                    "suggestions": suggestions,
+                }, indent=2)
+            }]
+        }
+    except Exception as e:
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({"error": str(e)})
+            }]
+        }
+
+
+async def log_excel_operation(input_data, tool_use_id, context):
+    tool_name = input_data.get("tool_name")
+
+    if tool_name.startswith("mcp__excel__"):
+        operation = tool_name.replace("mcp__excel__", "")
+        print(f"[EXCEL-OP] {operation}")
+    elif tool_name == "Skill":
+        skill_name = input_data.get("tool_input", {}).get("skill", "unknown")
+        print(f"[SKILL] Invoking: {skill_name}")
+
+    return {}
+
+
 excel_tools = create_sdk_mcp_server(
     name="excel",
     version="1.0.0",
-    tools=[create_spreadsheet, read_spreadsheet, edit_spreadsheet, add_formula, get_spreadsheet_info, format_cells]
+    tools=[create_spreadsheet, read_spreadsheet, edit_spreadsheet, add_formula, get_spreadsheet_info, format_cells, evaluate_spreadsheet]
 )
 
-options = ClaudeAgentOptions(
-    mcp_servers={"excel": excel_tools},
-    allowed_tools=[
-        "mcp__excel__create_spreadsheet",
-        "mcp__excel__read_spreadsheet",
-        "mcp__excel__edit_spreadsheet",
-        "mcp__excel__add_formula",
-        "mcp__excel__get_spreadsheet_info",
-        "mcp__excel__format_cells",
-        "Skill",
-    ],
-    cwd=str(Path(__file__).parent),
-    setting_sources=["project"],
-)
+async def run_agent(args) -> None:
+    """Run the Excel agent."""
 
-async def main():
+    # Build options with conditional hooks
+    options = ClaudeAgentOptions(
+        mcp_servers={"excel": excel_tools},
+        allowed_tools=[
+            "mcp__excel__create_spreadsheet",
+            "mcp__excel__read_spreadsheet",
+            "mcp__excel__edit_spreadsheet",
+            "mcp__excel__add_formula",
+            "mcp__excel__get_spreadsheet_info",
+            "mcp__excel__format_cells",
+            "mcp__excel__evaluate_spreadsheet",
+            "Skill",
+        ],
+        cwd=str(Path(__file__).parent),
+        setting_sources=["project"],
+        hooks={
+            "PreToolUse": [HookMatcher(hooks=[log_excel_operation])]
+        } if args.verbose else {}
+    )
+
+    # Determine prompt based on CLI args
+    if args.query:
+        prompt = args.query
+    elif args.evaluate:
+        prompt = f"Evaluate the quality of {args.evaluate} using the evaluate_spreadsheet tool and report any issues with suggestions for improvement."
+    elif args.create_budget:
+        output = args.output or "budget_tracker.xlsx"
+        prompt = f"Create a budget tracker spreadsheet following best practices from the xlsx skill. Include sample data, formulas for totals, and proper formatting. Save to {output}"
+    elif args.create_sales:
+        output = args.output or "sales_report.xlsx"
+        prompt = f"Create a sales report spreadsheet following best practices from the xlsx skill. Include sample data, formulas for totals and averages, and proper formatting. Save to {output}"
+    elif args.analyze:
+        prompt = f"Read and analyze the spreadsheet at {args.analyze}. Summarize the data structure, key metrics, and any insights."
+    else:
+        prompt = "List what spreadsheet operations you can help with and describe the xlsx skill best practices."
+
     async with ClaudeSDKClient(options=options) as client:
-        await client.query("Create an employee directory spreadsheet")
+        await client.query(prompt)
 
         async for message in client.receive_response():
             if isinstance(message, AssistantMessage):
                 for block in message.content:
                     if isinstance(block, TextBlock):
-                        print(f"[ASSISTANT]: {block.text}")
+                        print(f"{block.text}")
 
             elif isinstance(message, ResultMessage):
-                print(f"[RESULT]: {message.result}")
+                if args.verbose:
+                    print(f"[RESULT]: {message.result}")
 
-asyncio.run(main())
+
+# =============================================================================
+# CLI Configuration
+# =============================================================================
+
+cli = AgentCLI(
+    name="Excel Agent",
+    description="AI-powered spreadsheet creation and analysis using Claude Agent SDK",
+    arguments=[
+        CLIArgument(name="--query", short="-q", help="Direct query to execute"),
+        CLIArgument(name="--create-budget", help="Create budget tracker spreadsheet", action="store_true"),
+        CLIArgument(name="--create-sales", help="Create sales report spreadsheet", action="store_true"),
+        CLIArgument(name="--analyze", short="-a", help="Analyze existing spreadsheet file"),
+        CLIArgument(name="--evaluate", short="-e", help="Evaluate spreadsheet quality"),
+        CLIArgument(name="--output", short="-o", help="Output filename for created spreadsheets"),
+        CLIArgument(name="--verbose", short="-v", help="Show detailed tool usage", action="store_true"),
+    ],
+    epilog="""
+Examples:
+  python excel_agent.py -q "Create an employee directory spreadsheet"
+  python excel_agent.py --create-sales -o monthly_sales.xlsx
+  python excel_agent.py --create-budget -v
+  python excel_agent.py --evaluate existing_file.xlsx
+  python excel_agent.py --analyze sales_report.xlsx
+"""
+)
+
+
+if __name__ == "__main__":
+    exit_code = run_agent_cli(cli, run_agent)
+    sys.exit(exit_code)
