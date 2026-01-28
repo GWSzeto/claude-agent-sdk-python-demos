@@ -407,7 +407,10 @@ options = ClaudeAgentOptions(
         "mcp__excel__add_formula",
         "mcp__excel__get_spreadsheet_info",
         "mcp__excel__format_cells",
+        "Skill",
     ],
+    cwd=str(Path(__file__).parent),
+    setting_sources=["project"],
 )
 
 async def main():
