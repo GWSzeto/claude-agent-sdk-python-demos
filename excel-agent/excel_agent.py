@@ -5,6 +5,7 @@ from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.styles import Font, PatternFill, Alignment
 import pandas as pd
 
 @tool("create_spreadsheet", "Create a new Excel spreadsheet with data", {
@@ -284,12 +285,117 @@ async def get_spreadsheet_info(args):
             }]
         }
 
+@tool("format_cells", "Apply formatting to cells", {
+    "filename": str,
+    "sheet_name": str,
+    "formats": list
+})
+async def format_cells(args):
+    filename = args["filename"]
+    sheet_name = args.get("sheet_name")
+    formats = args["formats"]
+
+    if not Path(filename).exists():
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({"error": f"File not found: {filename}"})
+            }]
+        }
+
+    try:
+        wb = load_workbook(filename)
+        ws = wb[sheet_name] if sheet_name else wb.active
+
+        formatted_ranges = []
+
+        for fmt in formats:
+            cell_range = fmt.get("range")
+            if not cell_range:
+                continue
+
+            # Build style objects
+            font_obj = None
+            if "font" in fmt:
+                font_config = fmt["font"]
+                font_obj = Font(
+                    bold=font_config.get("bold", False),
+                    color=font_config.get("color"),
+                    size=font_config.get("size"),
+                )
+
+            fill_obj = None
+            if "fill" in fmt:
+                fill_config = fmt["fill"]
+                color = fill_config.get("color", "FFFFFF")
+                fill_obj = PatternFill(
+                    start_color=color,
+                    end_color=color,
+                    fill_type="solid",
+                )
+
+            alignment_obj = None
+            if "alignment" in fmt:
+                align_config = fmt["alignment"]
+                alignment_obj = Alignment(
+                    horizontal=align_config.get("horizontal"),
+                    vertical=align_config.get("vertical"),
+                )
+
+            number_format = fmt.get("number_format")
+
+            # Apply to range - handle single cell or range
+            if ":" in cell_range:
+                cells = ws[cell_range]
+                for row in cells:
+                    for cell in row:
+                        if font_obj:
+                            cell.font = font_obj
+                        if fill_obj:
+                            cell.fill = fill_obj
+                        if alignment_obj:
+                            cell.alignment = alignment_obj
+                        if number_format:
+                            cell.number_format = number_format
+            else:
+                cell = ws[cell_range]
+                if font_obj:
+                    cell.font = font_obj
+                if fill_obj:
+                    cell.fill = fill_obj
+                if alignment_obj:
+                    cell.alignment = alignment_obj
+                if number_format:
+                    cell.number_format = number_format
+
+            formatted_ranges.append(cell_range)
+
+        wb.save(filename)
+
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({
+                    "status": "success",
+                    "filename": filename,
+                    "formatted_ranges": formatted_ranges,
+                    "count": len(formatted_ranges),
+                }, indent=2)
+            }]
+        }
+    except Exception as e:
+        return {
+            "content": [{
+                "type": "text",
+                "text": json.dumps({"error": str(e)})
+            }]
+        }
 
 
 excel_tools = create_sdk_mcp_server(
     name="excel",
     version="1.0.0",
-    tools=[create_spreadsheet, read_spreadsheet, edit_spreadsheet, add_formula, get_spreadsheet_info]
+    tools=[create_spreadsheet, read_spreadsheet, edit_spreadsheet, add_formula, get_spreadsheet_info, format_cells]
 )
 
 options = ClaudeAgentOptions(
@@ -300,6 +406,7 @@ options = ClaudeAgentOptions(
         "mcp__excel__edit_spreadsheet",
         "mcp__excel__add_formula",
         "mcp__excel__get_spreadsheet_info",
+        "mcp__excel__format_cells",
     ],
 )
 
