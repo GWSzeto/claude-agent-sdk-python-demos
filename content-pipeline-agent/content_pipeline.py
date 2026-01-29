@@ -1,20 +1,25 @@
 """
-Content Pipeline Agent - Iteration 4
+Content Pipeline Agent - Iteration 5
 Demonstrates two-stage prompt chaining: Extract → Summarize with gates.
 
 Pattern: Python handles data, LLM returns structured responses.
 Skills integration for best practices guidance.
+CLI interface with error handling.
 """
 
 import re
 import asyncio
+import argparse
 from pathlib import Path
+from typing import TypeVar, Type
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     query,
 )
 from pydantic import BaseModel
+
+T = TypeVar('T', bound=BaseModel)
 
 from mock_data import get_content_by_id
 
@@ -166,54 +171,103 @@ def validate_summary(summary: str, key_points: list[str], original_length: int, 
 
 
 # =============================================================================
+# Generic Stage Runner with Error Handling
+# =============================================================================
+
+async def run_stage_safe(
+    prompt: str,
+    schema_class: Type[T],
+    stage_name: str,
+    verbose: bool = False
+) -> tuple[T | None, str | None]:
+    """Run a pipeline stage with error handling.
+
+    Returns:
+        Tuple of (result, error). If successful, error is None.
+        If failed, result is None and error contains the message.
+    """
+    try:
+        if verbose:
+            print(f"[{stage_name}] Starting...")
+
+        result = None
+        error = None
+
+        # Must consume full iterator to avoid async generator cleanup issues
+        async for message in query(
+            prompt=prompt,
+            options=ClaudeAgentOptions(
+                cwd=PROJECT_DIR,
+                setting_sources=["user", "project"],
+                allowed_tools=["Skill"],
+                output_format={
+                    "type": "json_schema",
+                    "schema": schema_class.model_json_schema()
+                }
+            )
+        ):
+            if isinstance(message, ResultMessage):
+                if message.structured_output:
+                    result = schema_class.model_validate(message.structured_output)
+                    if verbose:
+                        print(f"[{stage_name}] Success")
+                elif message.subtype == "error_max_structured_output_retries":
+                    error = f"{stage_name}: Could not produce valid output after retries"
+
+        # Return after loop completes
+        if error:
+            return None, error
+        if result:
+            return result, None
+        return None, f"{stage_name}: No result received"
+
+    except Exception as e:
+        return None, f"{stage_name}: {str(e)}"
+
+
+# =============================================================================
 # Pipeline Step Functions (LLM calls with structured outputs)
 # =============================================================================
 
-async def run_extract(content_id: str) -> ExtractResult | None:
+async def run_extract(content_id: str, verbose: bool = False) -> tuple[ExtractResult | None, str | None]:
     """
     Step 1: Extract content.
     - Python fetches and cleans the data
     - LLM confirms/returns the structured result
+
+    Returns:
+        Tuple of (ExtractResult, error). If successful, error is None.
     """
     # Python does the data work
     data = fetch_and_clean_content(content_id)
     if not data:
-        return None
+        return None, f"Content not found: {content_id}"
 
-    # LLM returns structured response - consume full iterator
-    result = None
-    async for message in query(
-        prompt=f"""I have extracted content from a document. Please return it in the structured format.
+    prompt = f"""I have extracted content from a document. Please return it in the structured format.
 
 Title: {data['title']}
 Original length: {data['original_length']} characters
 Extracted length: {data['extracted_length']} characters
 Extracted content:
-{data['extracted_content'][:3000]}""",
-        options=ClaudeAgentOptions(
-            cwd=PROJECT_DIR,
-            setting_sources=["user", "project"],
-            allowed_tools=["Skill"],
-            output_format={
-                "type": "json_schema",
-                "schema": ExtractResult.model_json_schema()
-            }
-        )
-    ):
-        if isinstance(message, ResultMessage) and message.structured_output:
-            result = ExtractResult.model_validate(message.structured_output)
-    return result
+{data['extracted_content'][:3000]}"""
+
+    return await run_stage_safe(prompt, ExtractResult, "EXTRACT", verbose)
 
 
-async def run_summarize(content: str, style: str = "bullets", max_points: int = 5) -> SummarizeResult | None:
+async def run_summarize(
+    content: str,
+    style: str = "bullets",
+    max_points: int = 5,
+    verbose: bool = False
+) -> tuple[SummarizeResult | None, str | None]:
     """
     Step 3: Summarize content.
     - LLM does the summarization and returns structured result
+
+    Returns:
+        Tuple of (SummarizeResult, error). If successful, error is None.
     """
-    # Consume full iterator to avoid early exit issues
-    result = None
-    async for message in query(
-        prompt=f"""Summarize the following content into key points.
+    prompt = f"""Summarize the following content into key points.
 
 Style: {style}
 Maximum key points: {max_points}
@@ -221,29 +275,29 @@ Maximum key points: {max_points}
 Content to summarize:
 {content[:3000]}
 
-Provide a concise summary and extract the key points.""",
-        options=ClaudeAgentOptions(
-            cwd=PROJECT_DIR,
-            setting_sources=["user", "project"],
-            allowed_tools=["Skill"],
-            output_format={
-                "type": "json_schema",
-                "schema": SummarizeResult.model_json_schema()
-            }
-        )
-    ):
-        if isinstance(message, ResultMessage) and message.structured_output:
-            result = SummarizeResult.model_validate(message.structured_output)
-    return result
+Provide a concise summary and extract the key points."""
+
+    return await run_stage_safe(prompt, SummarizeResult, "SUMMARIZE", verbose)
 
 
 # =============================================================================
 # Pipeline Runner
 # =============================================================================
 
-async def main(content_id: str):
+async def run_pipeline(
+    content_id: str,
+    style: str = "bullets",
+    max_points: int = 5,
+    verbose: bool = False
+) -> dict:
     """
     Run the two-stage pipeline: Extract → Summarize with gates.
+
+    Args:
+        content_id: ID of content to process
+        style: Summary style (bullets, executive)
+        max_points: Maximum number of key points
+        verbose: Show detailed output
 
     Flow:
     1. Python fetches/cleans data, LLM returns ExtractResult
@@ -251,55 +305,61 @@ async def main(content_id: str):
     3. LLM summarizes, returns SummarizeResult
     4. Python validates summary (gate)
     """
-    print(f"\n[PIPELINE] Starting for {content_id}")
+    if verbose:
+        print(f"\n[PIPELINE] Starting for {content_id}")
 
     # =========================================
     # STEP 1: Extract content
     # =========================================
-    print("[STEP 1] Extracting content...")
-    step1_result = await run_extract(content_id)
+    step1_result, error = await run_extract(content_id, verbose)
 
-    if not step1_result:
-        print("[STEP 1] FAILED - No result")
-        return {"success": False, "error": "Extraction failed"}
+    if error:
+        if verbose:
+            print(f"[EXTRACT] FAILED - {error}")
+        return {"success": False, "error": error}
 
-    print(f"[STEP 1] SUCCESS - Extracted {step1_result.extracted_length} chars from {step1_result.original_length}")
-    print(f"[STEP 1] Title: {step1_result.title}")
+    if verbose:
+        print(f"[EXTRACT] SUCCESS - Extracted {step1_result.extracted_length} chars from {step1_result.original_length}")
+        print(f"[EXTRACT] Title: {step1_result.title}")
 
     # =========================================
     # STEP 2: Validate extraction (Gate - Python)
     # =========================================
-    print("\n[STEP 2] Validating extraction quality...")
     step2_result = validate_extraction(
         step1_result.extracted_content,
         step1_result.original_length,
         step1_result.extracted_length
     )
 
-    print(f"[STEP 2] {'PASSED' if step2_result.passed else 'FAILED'}")
-    print(f"[STEP 2] Reason: {step2_result.reason}")
-    print(f"[STEP 2] Checks: {step2_result.checks}")
+    if verbose:
+        print(f"\n[GATE] Extraction: {'PASSED' if step2_result.passed else 'FAILED'}")
+        print(f"[GATE] Reason: {step2_result.reason}")
+        print(f"[GATE] Checks: {step2_result.checks}")
 
     if not step2_result.passed:
-        print("\n[PIPELINE] FAILED at extraction_gate")
         return {"success": False, "failed_at": "extraction_gate", "reason": step2_result.reason}
 
     # =========================================
     # STEP 3: Summarize content (LLM)
     # =========================================
-    print("\n[STEP 3] Summarizing content...")
-    step3_result = await run_summarize(step1_result.extracted_content)
+    step3_result, error = await run_summarize(
+        step1_result.extracted_content,
+        style=style,
+        max_points=max_points,
+        verbose=verbose
+    )
 
-    if not step3_result:
-        print("[STEP 3] FAILED - No result")
-        return {"success": False, "error": "Summarization failed"}
+    if error:
+        if verbose:
+            print(f"[SUMMARIZE] FAILED - {error}")
+        return {"success": False, "error": error}
 
-    print(f"[STEP 3] SUCCESS - Summary: {step3_result.summary_length} chars, {len(step3_result.key_points)} key points")
+    if verbose:
+        print(f"[SUMMARIZE] SUCCESS - {step3_result.summary_length} chars, {len(step3_result.key_points)} key points")
 
     # =========================================
     # STEP 4: Validate summary (Gate - Python)
     # =========================================
-    print("\n[STEP 4] Validating summary quality...")
     step4_result = validate_summary(
         step3_result.summary,
         step3_result.key_points,
@@ -307,15 +367,17 @@ async def main(content_id: str):
         step3_result.summary_length
     )
 
-    print(f"[STEP 4] {'PASSED' if step4_result.passed else 'FAILED'}")
-    print(f"[STEP 4] Reason: {step4_result.reason}")
-    print(f"[STEP 4] Checks: {step4_result.checks}")
+    if verbose:
+        print(f"\n[GATE] Summary: {'PASSED' if step4_result.passed else 'FAILED'}")
+        print(f"[GATE] Reason: {step4_result.reason}")
+        print(f"[GATE] Checks: {step4_result.checks}")
 
     # =========================================
     # Return final result
     # =========================================
     if step4_result.passed:
-        print("\n[PIPELINE] SUCCESS")
+        if verbose:
+            print("\n[PIPELINE] SUCCESS")
         return {
             "success": True,
             "title": step1_result.title,
@@ -323,7 +385,6 @@ async def main(content_id: str):
             "key_points": step3_result.key_points
         }
     else:
-        print("\n[PIPELINE] FAILED at summary_gate")
         return {
             "success": False,
             "failed_at": "summary_gate",
@@ -332,17 +393,65 @@ async def main(content_id: str):
 
 
 # =============================================================================
-# Entry Point
+# CLI Entry Point
 # =============================================================================
 
-if __name__ == "__main__":
-    import sys
-    content_id = sys.argv[1] if len(sys.argv) > 1 else "article-001"
-    result = asyncio.run(main(content_id))
+def main():
+    """CLI entry point with argparse."""
+    parser = argparse.ArgumentParser(
+        description="Content Pipeline Agent - Extract and summarize content",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python content_pipeline.py -i article-001
+  python content_pipeline.py -i article-002 --style executive --max-points 3
+  python content_pipeline.py -i article-001 -v
+        """
+    )
+    parser.add_argument(
+        "-i", "--input",
+        required=True,
+        help="Content ID to process (e.g., article-001)"
+    )
+    parser.add_argument(
+        "--style",
+        default="bullets",
+        choices=["bullets", "executive"],
+        help="Summary style (default: bullets)"
+    )
+    parser.add_argument(
+        "--max-points",
+        type=int,
+        default=5,
+        help="Maximum number of key points (default: 5)"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show detailed pipeline output"
+    )
+
+    args = parser.parse_args()
+
+    result = asyncio.run(run_pipeline(
+        args.input,
+        style=args.style,
+        max_points=args.max_points,
+        verbose=args.verbose
+    ))
 
     if result["success"]:
-        print("\n--- SUMMARY ---")
+        print(f"\n--- {result['title']} ---")
         print(result["summary"])
-        print("\n--- KEY POINTS ---")
+        print("\nKey Points:")
         for i, point in enumerate(result["key_points"], 1):
-            print(f"{i}. {point}")
+            print(f"  {i}. {point}")
+    else:
+        error = result.get("error") or result.get("reason")
+        failed_at = result.get("failed_at", "unknown")
+        print(f"\nPipeline failed at: {failed_at}")
+        print(f"Error: {error}")
+
+
+if __name__ == "__main__":
+    main()

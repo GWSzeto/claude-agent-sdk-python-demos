@@ -376,14 +376,29 @@ options = ClaudeAgentOptions(
 ### Error Handling
 
 ```python
-async def run_stage_safe(prompt: str, schema_class: Type[T], stage_name: str) -> tuple[T | None, str | None]:
+from typing import TypeVar, Type
+from pydantic import BaseModel
+
+T = TypeVar('T', bound=BaseModel)
+
+async def run_stage_safe(
+    prompt: str,
+    schema_class: Type[T],
+    stage_name: str,
+    verbose: bool = False
+) -> tuple[T | None, str | None]:
     """Run stage with error handling."""
 
     try:
+        if verbose:
+            print(f"[{stage_name}] Starting...")
+
         async for message in query(
             prompt=prompt,
             options=ClaudeAgentOptions(
-                model="sonnet",
+                cwd=PROJECT_DIR,
+                setting_sources=["user", "project"],
+                allowed_tools=["Skill"],
                 output_format={
                     "type": "json_schema",
                     "schema": schema_class.model_json_schema()
@@ -392,7 +407,10 @@ async def run_stage_safe(prompt: str, schema_class: Type[T], stage_name: str) ->
         ):
             if isinstance(message, ResultMessage):
                 if message.subtype == "success" and message.structured_output:
-                    return schema_class.model_validate(message.structured_output), None
+                    result = schema_class.model_validate(message.structured_output)
+                    if verbose:
+                        print(f"[{stage_name}] Success")
+                    return result, None
                 elif message.subtype == "error_max_structured_output_retries":
                     return None, f"{stage_name}: Could not produce valid output"
 
@@ -410,20 +428,26 @@ import argparse
 def main():
     parser = argparse.ArgumentParser(description="Content Pipeline Agent")
     parser.add_argument("-i", "--input", required=True, help="Content ID")
-    parser.add_argument("--target-lang", default="es", help="Target language")
-    parser.add_argument("--format", default="markdown", help="Output format")
+    parser.add_argument("--style", default="bullets", help="Summary style (bullets, executive)")
+    parser.add_argument("--max-points", type=int, default=5, help="Maximum key points")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Show detailed output")
     args = parser.parse_args()
 
-    result = asyncio.run(run_full_pipeline(
+    result = asyncio.run(main_pipeline(
         args.input,
-        target_language=args.target_lang,
-        output_format=args.format
+        style=args.style,
+        max_points=args.max_points,
+        verbose=args.verbose
     ))
 
     if result["success"]:
-        print(result["output"])
+        print(f"\n--- {result['title']} ---")
+        print(result["summary"])
+        print("\nKey Points:")
+        for i, point in enumerate(result["key_points"], 1):
+            print(f"  {i}. {point}")
     else:
-        print(f"Failed at: {result['failed_at']}")
+        print(f"Failed: {result.get('error', result.get('reason'))}")
 
 if __name__ == "__main__":
     main()
