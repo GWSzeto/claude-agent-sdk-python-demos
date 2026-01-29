@@ -1,17 +1,17 @@
 """
-Content Pipeline Agent - Iteration 2
-Demonstrates prompt chaining with structured outputs.
+Content Pipeline Agent - Iteration 3
+Demonstrates two-stage prompt chaining: Extract → Summarize with gates.
+
+Pattern: Python handles data, LLM returns structured responses.
+No MCP tools needed - just structured outputs.
 """
 
-import json
 import re
 import asyncio
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
     query,
-    tool,
-    create_sdk_mcp_server,
 )
 from pydantic import BaseModel
 
@@ -35,8 +35,15 @@ class GateResult(BaseModel):
     checks: dict[str, bool]
 
 
+class SummarizeResult(BaseModel):
+    summary: str
+    key_points: list[str]
+    original_length: int
+    summary_length: int
+
+
 # =============================================================================
-# Helper Functions
+# Helper Functions (Python does the data work)
 # =============================================================================
 
 def strip_html(html_content: str) -> str:
@@ -64,24 +71,11 @@ def strip_html(html_content: str) -> str:
     return text
 
 
-# =============================================================================
-# MCP Tools
-# =============================================================================
-
-@tool("extract_content", "Extracts and cleans raw HTML/text content", {"content_id": str})
-async def extract_content(args: dict) -> dict:
-    """Fetch content from mock data and clean it."""
-    content_id = args.get("content_id", "")
-
-    # Fetch from mock data
+def fetch_and_clean_content(content_id: str) -> dict | None:
+    """Fetch content from mock data and clean it (Python function, not LLM)."""
     content_data = get_content_by_id(content_id)
     if not content_data:
-        return {
-            "content": [{
-                "type": "text",
-                "text": json.dumps({"error": f"Content not found: {content_id}"})
-            }]
-        }
+        return None
 
     raw_content = content_data["content"]
     content_format = content_data["format"]
@@ -90,35 +84,19 @@ async def extract_content(args: dict) -> dict:
     if content_format == "html":
         extracted = strip_html(raw_content)
     else:
-        # For text/markdown, just normalize whitespace
         extracted = re.sub(r'\s+', ' ', raw_content).strip()
 
-    result = {
+    return {
         "extracted_content": extracted,
         "original_length": len(raw_content),
         "extracted_length": len(extracted),
-        "title": content_data.get("title", "Untitled")
-    }
-
-    return {
-        "content": [{
-            "type": "text",
-            "text": json.dumps(result)
-        }]
+        "title": content_data.get("title", "Untitled"),
+        "format": content_format
     }
 
 
-@tool("extraction_gate", "Validate extracted content meets quality criteria", {
-    "extracted_content": str,
-    "original_length": int,
-    "extracted_length": int
-})
-async def extraction_gate(args: dict) -> dict:
-    """Validate extraction quality."""
-    extracted_content = args.get("extracted_content", "")
-    original_length = args.get("original_length", 0)
-    extracted_length = args.get("extracted_length", 0)
-
+def validate_extraction(extracted_content: str, original_length: int, extracted_length: int) -> GateResult:
+    """Validate extraction quality (Python function, not LLM)."""
     checks = {}
     all_passed = True
 
@@ -140,36 +118,113 @@ async def extraction_gate(args: dict) -> dict:
     if not has_substance:
         all_passed = False
 
-    # Build reason
     if all_passed:
         reason = "All quality checks passed"
     else:
         failed = [k for k, v in checks.items() if not v]
         reason = f"Failed checks: {', '.join(failed)}"
 
-    result = {
-        "passed": all_passed,
-        "reason": reason,
-        "checks": checks
-    }
+    return GateResult(passed=all_passed, reason=reason, checks=checks)
 
-    return {
-        "content": [{
-            "type": "text",
-            "text": json.dumps(result)
-        }]
-    }
+
+def validate_summary(summary: str, key_points: list[str], original_length: int, summary_length: int) -> GateResult:
+    """Validate summary quality (Python function, not LLM)."""
+    checks = {}
+    all_passed = True
+
+    # Check 1: Has enough key points (at least 3)
+    has_points = len(key_points) >= 3
+    checks["has_key_points"] = has_points
+    if not has_points:
+        all_passed = False
+
+    # Check 2: Reasonable compression (summary < 40% of original)
+    if original_length > 0:
+        ratio = summary_length / original_length
+        good_compression = ratio < 0.4
+        checks["good_compression"] = good_compression
+        if not good_compression:
+            all_passed = False
+
+    # Check 3: Summary has substance (> 50 chars)
+    has_content = len(summary.strip()) > 50
+    checks["has_content"] = has_content
+    if not has_content:
+        all_passed = False
+
+    if all_passed:
+        reason = "All summary checks passed"
+    else:
+        failed = [k for k, v in checks.items() if not v]
+        reason = f"Failed checks: {', '.join(failed)}"
+
+    return GateResult(passed=all_passed, reason=reason, checks=checks)
 
 
 # =============================================================================
-# MCP Server Setup
+# Pipeline Step Functions (LLM calls with structured outputs)
 # =============================================================================
 
-content_tools = create_sdk_mcp_server(
-    name="content-pipeline",
-    version="1.0.0",
-    tools=[extract_content, extraction_gate]
-)
+async def run_extract(content_id: str) -> ExtractResult | None:
+    """
+    Step 1: Extract content.
+    - Python fetches and cleans the data
+    - LLM confirms/returns the structured result
+    """
+    # Python does the data work
+    data = fetch_and_clean_content(content_id)
+    if not data:
+        return None
+
+    # LLM returns structured response - consume full iterator
+    result = None
+    async for message in query(
+        prompt=f"""I have extracted content from a document. Please return it in the structured format.
+
+Title: {data['title']}
+Original length: {data['original_length']} characters
+Extracted length: {data['extracted_length']} characters
+Extracted content:
+{data['extracted_content'][:3000]}""",
+        options=ClaudeAgentOptions(
+            output_format={
+                "type": "json_schema",
+                "schema": ExtractResult.model_json_schema()
+            }
+        )
+    ):
+        if isinstance(message, ResultMessage) and message.structured_output:
+            result = ExtractResult.model_validate(message.structured_output)
+    return result
+
+
+async def run_summarize(content: str, style: str = "bullets", max_points: int = 5) -> SummarizeResult | None:
+    """
+    Step 3: Summarize content.
+    - LLM does the summarization and returns structured result
+    """
+    # Consume full iterator to avoid early exit issues
+    result = None
+    async for message in query(
+        prompt=f"""Summarize the following content into key points.
+
+Style: {style}
+Maximum key points: {max_points}
+
+Content to summarize:
+{content[:3000]}
+
+Provide a concise summary and extract the key points.""",
+        options=ClaudeAgentOptions(
+            output_format={
+                "type": "json_schema",
+                "schema": SummarizeResult.model_json_schema()
+            }
+        )
+    ):
+        if isinstance(message, ResultMessage) and message.structured_output:
+            result = SummarizeResult.model_validate(message.structured_output)
+    return result
 
 
 # =============================================================================
@@ -178,11 +233,13 @@ content_tools = create_sdk_mcp_server(
 
 async def main(content_id: str):
     """
-    Run the extract + gate pipeline.
+    Run the two-stage pipeline: Extract → Summarize with gates.
 
     Flow:
-    1. query() with extract_content tool -> ExtractResult
-    2. query() with extraction_gate tool -> GateResult
+    1. Python fetches/cleans data, LLM returns ExtractResult
+    2. Python validates extraction (gate)
+    3. LLM summarizes, returns SummarizeResult
+    4. Python validates summary (gate)
     """
     print(f"\n[PIPELINE] Starting for {content_id}")
 
@@ -190,21 +247,7 @@ async def main(content_id: str):
     # STEP 1: Extract content
     # =========================================
     print("[STEP 1] Extracting content...")
-
-    step1_result = None
-    async for message in query(
-        prompt=f"Use the extract_content tool to extract content from content_id='{content_id}'",
-        options=ClaudeAgentOptions(
-            output_format={
-                "type": "json_schema",
-                "schema": ExtractResult.model_json_schema()
-            },
-            allowed_tools=["mcp__content-pipeline__extract_content"],
-            mcp_servers={"content-tools": content_tools}
-        )
-    ):
-        if isinstance(message, ResultMessage) and message.structured_output:
-            step1_result = ExtractResult.model_validate(message.structured_output)
+    step1_result = await run_extract(content_id)
 
     if not step1_result:
         print("[STEP 1] FAILED - No result")
@@ -214,55 +257,67 @@ async def main(content_id: str):
     print(f"[STEP 1] Title: {step1_result.title}")
 
     # =========================================
-    # STEP 2: Validate extraction (Gate)
+    # STEP 2: Validate extraction (Gate - Python)
     # =========================================
     print("\n[STEP 2] Validating extraction quality...")
-
-    step2_result = None
-    async for message in query(
-        prompt=f"""Use the extraction_gate tool to validate the extracted content.
-
-Parameters:
-- extracted_content: "{step1_result.extracted_content[:500]}..."
-- original_length: {step1_result.original_length}
-- extracted_length: {step1_result.extracted_length}""",
-        options=ClaudeAgentOptions(
-            output_format={
-                "type": "json_schema",
-                "schema": GateResult.model_json_schema()
-            },
-            allowed_tools=["mcp__content-pipeline__extraction_gate"],
-            mcp_servers={"content-tools": content_tools}
-        )
-    ):
-        if isinstance(message, ResultMessage) and message.structured_output:
-            step2_result = GateResult.model_validate(message.structured_output)
-
-    if not step2_result:
-        print("[STEP 2] FAILED - No result")
-        return {"success": False, "error": "Gate validation failed"}
+    step2_result = validate_extraction(
+        step1_result.extracted_content,
+        step1_result.original_length,
+        step1_result.extracted_length
+    )
 
     print(f"[STEP 2] {'PASSED' if step2_result.passed else 'FAILED'}")
     print(f"[STEP 2] Reason: {step2_result.reason}")
     print(f"[STEP 2] Checks: {step2_result.checks}")
 
+    if not step2_result.passed:
+        print("\n[PIPELINE] FAILED at extraction_gate")
+        return {"success": False, "failed_at": "extraction_gate", "reason": step2_result.reason}
+
+    # =========================================
+    # STEP 3: Summarize content (LLM)
+    # =========================================
+    print("\n[STEP 3] Summarizing content...")
+    step3_result = await run_summarize(step1_result.extracted_content)
+
+    if not step3_result:
+        print("[STEP 3] FAILED - No result")
+        return {"success": False, "error": "Summarization failed"}
+
+    print(f"[STEP 3] SUCCESS - Summary: {step3_result.summary_length} chars, {len(step3_result.key_points)} key points")
+
+    # =========================================
+    # STEP 4: Validate summary (Gate - Python)
+    # =========================================
+    print("\n[STEP 4] Validating summary quality...")
+    step4_result = validate_summary(
+        step3_result.summary,
+        step3_result.key_points,
+        step3_result.original_length,
+        step3_result.summary_length
+    )
+
+    print(f"[STEP 4] {'PASSED' if step4_result.passed else 'FAILED'}")
+    print(f"[STEP 4] Reason: {step4_result.reason}")
+    print(f"[STEP 4] Checks: {step4_result.checks}")
+
     # =========================================
     # Return final result
     # =========================================
-    if step2_result.passed:
+    if step4_result.passed:
         print("\n[PIPELINE] SUCCESS")
         return {
             "success": True,
             "title": step1_result.title,
-            "extracted": step1_result.extracted_content,
-            "length": step1_result.extracted_length
+            "summary": step3_result.summary,
+            "key_points": step3_result.key_points
         }
     else:
-        print("\n[PIPELINE] FAILED at extraction_gate")
+        print("\n[PIPELINE] FAILED at summary_gate")
         return {
             "success": False,
-            "failed_at": "extraction_gate",
-            "reason": step2_result.reason
+            "failed_at": "summary_gate",
+            "reason": step4_result.reason
         }
 
 
@@ -276,5 +331,8 @@ if __name__ == "__main__":
     result = asyncio.run(main(content_id))
 
     if result["success"]:
-        print(f"\n--- EXTRACTED CONTENT (first 300 chars) ---")
-        print(result["extracted"][:300] + "...")
+        print(f"\n--- SUMMARY ---")
+        print(result["summary"])
+        print(f"\n--- KEY POINTS ---")
+        for i, point in enumerate(result["key_points"], 1):
+            print(f"{i}. {point}")
