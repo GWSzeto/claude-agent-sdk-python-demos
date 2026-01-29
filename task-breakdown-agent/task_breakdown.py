@@ -1,6 +1,7 @@
 from claude_agent_sdk import AgentDefinition
 from pydantic import BaseModel
-from claude_agent_sdk import ClaudeAgentOptions, AgentDefinition, ResultMessage, query
+from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+import asyncio
 
 class WorkStreamPlan(BaseModel):
     goal: str
@@ -120,7 +121,52 @@ Explain your reasoning briefly.""",
 
     return result
 
-import asyncio
+
+async def run_worker(goal: str, work_stream: str, verbose: bool = False) -> str | None:
+    worker_name = WORK_STREAM_TO_WORKER[work_stream]
+    if not worker_name:
+        if verbose:
+            print(f"[WORKER] Unknown work stream: {work_stream}")
+        return None
+
+    if verbose:
+        print(f"[WORKER] Running {worker_name} for '{work_stream}' stream...")
+
+    result = None
+    async for message in query(
+        prompt=f"""Break down this goal into specific, actionable tasks for the {work_stream} work stream.
+
+        Goal: {goal}
+
+        Generate a clear markdown checklist. Be specific and practical.""",
+        options=ClaudeAgentOptions(
+            allowed_tools=["Task"],
+            agents={worker_name: WORKER_AGENTS[worker_name]},
+        )
+    ):
+        if isinstance(message, ResultMessage) and message.structured_output:
+            result = message.result
+
+    return result
+
+
+async def run_all_workers(goal: str, work_streams: list[str], verbose: bool = False) -> dict[str, str]:
+    if verbose:
+        print(f"\n[ORCHESTRATOR] Dispatching {len(work_streams)} workers...")
+
+    results = {}
+    for stream in work_streams:
+        output = await run_worker(goal, stream, verbose)
+        if output:
+            results[stream] = output
+            if verbose:
+                print(f"[WORKER] {stream}: Generated tasks")
+
+        else:
+            if verbose:
+                print(f"[WORKER] {stream}: No output")
+
+    return results
 
 
 async def run_orchestrator(goal: str, verbose: bool = True):
@@ -131,14 +177,30 @@ async def run_orchestrator(goal: str, verbose: bool = True):
 
     plan = await identify_work_streams(goal, verbose=verbose)
 
-    if plan:
-        print(f"\n[RESULT] Goal: {plan.goal}")
-        print(f"[RESULT] Work streams: {plan.work_streams}")
-        print(f"[RESULT] Reasoning: {plan.reasoning}")
-        return plan
-    else:
+    if not plan:
         print("[ERROR] Failed to identify work streams")
         return None
+
+    print(f"\n[RESULT] Work streams: {plan.work_streams}")
+
+    worker_results = await run_all_workers(goal, plan.work_streams, verbose=verbose)
+
+    if not worker_results:
+        print("[ERROR] No worker results")
+        return None
+    
+    print("\n" + "=" * 50)
+    print("WORKER OUTPUTS")
+    print("=" * 50)
+    for stream, tasks in worker_results.items():
+        print(f"\n### {stream.upper()}")
+        print(tasks)
+    
+    return {
+        "goal": goal,
+        "work_streams": plan.work_streams,
+        "worker_results": worker_results,
+    }
 
 
 def main():
