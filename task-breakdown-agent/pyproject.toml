@@ -1,0 +1,12 @@
+[project]
+name = "task-breakdown-agent"
+version = "0.1.0"
+description = "Task Breakdown Agent demonstrating the Orchestrator-Workers pattern"
+requires-python = ">=3.11"
+dependencies = [
+    "claude-agent-sdk",
+    "pydantic>=2.0",
+]
+
+[project.scripts]
+task-breakdown = "task_breakdown:main"
