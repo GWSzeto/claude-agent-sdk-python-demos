@@ -1,13 +1,14 @@
 """
-Content Pipeline Agent - Iteration 3
+Content Pipeline Agent - Iteration 4
 Demonstrates two-stage prompt chaining: Extract → Summarize with gates.
 
 Pattern: Python handles data, LLM returns structured responses.
-No MCP tools needed - just structured outputs.
+Skills integration for best practices guidance.
 """
 
 import re
 import asyncio
+from pathlib import Path
 from claude_agent_sdk import (
     ClaudeAgentOptions,
     ResultMessage,
@@ -16,6 +17,9 @@ from claude_agent_sdk import (
 from pydantic import BaseModel
 
 from mock_data import get_content_by_id
+
+# Project directory for skill loading
+PROJECT_DIR = str(Path(__file__).parent.resolve())
 
 
 # =============================================================================
@@ -187,6 +191,9 @@ Extracted length: {data['extracted_length']} characters
 Extracted content:
 {data['extracted_content'][:3000]}""",
         options=ClaudeAgentOptions(
+            cwd=PROJECT_DIR,
+            setting_sources=["user", "project"],
+            allowed_tools=["Skill"],
             output_format={
                 "type": "json_schema",
                 "schema": ExtractResult.model_json_schema()
@@ -216,6 +223,9 @@ Content to summarize:
 
 Provide a concise summary and extract the key points.""",
         options=ClaudeAgentOptions(
+            cwd=PROJECT_DIR,
+            setting_sources=["user", "project"],
+            allowed_tools=["Skill"],
             output_format={
                 "type": "json_schema",
                 "schema": SummarizeResult.model_json_schema()
@@ -331,8 +341,8 @@ if __name__ == "__main__":
     result = asyncio.run(main(content_id))
 
     if result["success"]:
-        print(f"\n--- SUMMARY ---")
+        print("\n--- SUMMARY ---")
         print(result["summary"])
-        print(f"\n--- KEY POINTS ---")
+        print("\n--- KEY POINTS ---")
         for i, point in enumerate(result["key_points"], 1):
             print(f"{i}. {point}")

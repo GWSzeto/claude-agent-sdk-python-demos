@@ -54,7 +54,7 @@ async for message in query(
 The **Content Pipeline Agent** transforms raw content through a multi-stage pipeline:
 
 ```
-Raw Content → Extract → Gate → Summarize → Gate → Translate → Gate → Format → Final Output
+Raw Content → Extract → Gate → Summarize → Gate → Final Output
 ```
 
 Each stage is a `query()` call with its own Pydantic schema.
@@ -326,124 +326,7 @@ async def run_two_stage_pipeline(content_id: str, style: str = "bullets") -> dic
 
 ---
 
-## Iteration 4: Full Pipeline (Extract → Summarize → Translate → Format)
-
-**Goal**: Complete pipeline with all transformation stages.
-
-### Additional Models
-
-```python
-class TranslateResult(BaseModel):
-    translated_content: str
-    source_language: str
-    target_language: str
-
-class FormatResult(BaseModel):
-    formatted_content: str
-    format_type: str  # "markdown", "json", "plain"
-```
-
-### Generic Stage Runner
-
-```python
-from typing import TypeVar, Type
-from pydantic import BaseModel
-
-T = TypeVar('T', bound=BaseModel)
-
-async def run_stage(prompt: str, schema_class: Type[T]) -> T | None:
-    """Generic stage runner with structured output."""
-
-    async for message in query(
-        prompt=prompt,
-        options=ClaudeAgentOptions(
-            model="sonnet",
-            output_format={
-                "type": "json_schema",
-                "schema": schema_class.model_json_schema()
-            }
-        )
-    ):
-        if isinstance(message, ResultMessage) and message.structured_output:
-            return schema_class.model_validate(message.structured_output)
-
-    return None
-```
-
-### Full Pipeline
-
-```python
-async def run_full_pipeline(
-    content_id: str,
-    target_language: str = "es",
-    output_format: str = "markdown"
-) -> dict:
-    """Extract → Summarize → Translate → Format with gates."""
-
-    stages = []
-
-    # Extract
-    extract = await run_stage(
-        f"Extract main content from: {get_content_by_id(content_id)['content'][:2000]}",
-        ExtractResult
-    )
-    if not extract:
-        return {"success": False, "failed_at": "extract"}
-    stages.append(("extract", extract))
-
-    # Extract Gate
-    gate1 = await run_stage(
-        f"Validate extraction: {extract.extracted_content[:500]}...",
-        GateResult
-    )
-    if not gate1 or not gate1.passed:
-        return {"success": False, "failed_at": "extract_gate"}
-
-    # Summarize
-    summary = await run_stage(
-        f"Summarize: {extract.extracted_content[:2000]}",
-        SummarizeResult
-    )
-    if not summary:
-        return {"success": False, "failed_at": "summarize"}
-    stages.append(("summarize", summary))
-
-    # Summary Gate
-    gate2 = await run_stage(
-        f"Validate summary preserves key info. Original: {extract.extracted_content[:500]}... Summary: {summary.summary}",
-        GateResult
-    )
-    if not gate2 or not gate2.passed:
-        return {"success": False, "failed_at": "summary_gate"}
-
-    # Translate
-    translate = await run_stage(
-        f"Translate to {target_language}: {summary.summary}",
-        TranslateResult
-    )
-    if not translate:
-        return {"success": False, "failed_at": "translate"}
-    stages.append(("translate", translate))
-
-    # Format
-    formatted = await run_stage(
-        f"Format as {output_format}: {translate.translated_content}",
-        FormatResult
-    )
-    if not formatted:
-        return {"success": False, "failed_at": "format"}
-    stages.append(("format", formatted))
-
-    return {
-        "success": True,
-        "output": formatted.formatted_content,
-        "stages": [(name, s.model_dump()) for name, s in stages]
-    }
-```
-
----
-
-## Iteration 5: Skills Integration
+## Iteration 4: Skills Integration
 
 **Goal**: Add content-pipeline skill for best practices.
 
@@ -486,7 +369,7 @@ options = ClaudeAgentOptions(
 
 ---
 
-## Iteration 6: CLI and Error Handling
+## Iteration 5: CLI and Error Handling
 
 **Goal**: Add CLI interface and robust error handling.
 
@@ -587,13 +470,4 @@ class SummarizeResult(BaseModel):
     key_points: list[str]
     original_length: int
     summary_length: int
-
-class TranslateResult(BaseModel):
-    translated_content: str
-    source_language: str
-    target_language: str
-
-class FormatResult(BaseModel):
-    formatted_content: str
-    format_type: str
 ```
