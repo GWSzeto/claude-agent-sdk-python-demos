@@ -1,7 +1,15 @@
-from claude_agent_sdk import AgentDefinition
-from pydantic import BaseModel
-from claude_agent_sdk import ClaudeAgentOptions, ResultMessage, query
+"""
+Task Breakdown Agent - Iteration 5
+Demonstrates the Orchestrator-Workers pattern.
+
+Pattern: Orchestrator dynamically decides work streams, workers generate tasks,
+orchestrator synthesizes unified plan.
+"""
+
 import asyncio
+import argparse
+from claude_agent_sdk import AgentDefinition, ClaudeAgentOptions, ResultMessage, query
+from pydantic import BaseModel
 
 class WorkStreamPlan(BaseModel):
     goal: str
@@ -136,15 +144,15 @@ async def run_worker(goal: str, work_stream: str, verbose: bool = False) -> str 
     async for message in query(
         prompt=f"""Break down this goal into specific, actionable tasks for the {work_stream} work stream.
 
-        Goal: {goal}
+Goal: {goal}
 
-        Generate a clear markdown checklist. Be specific and practical.""",
+Generate a clear markdown checklist. Be specific and practical.""",
         options=ClaudeAgentOptions(
             allowed_tools=["Task"],
             agents={worker_name: WORKER_AGENTS[worker_name]},
         )
     ):
-        if isinstance(message, ResultMessage) and message.structured_output:
+        if isinstance(message, ResultMessage):
             result = message.result
 
     return result
@@ -169,44 +177,143 @@ async def run_all_workers(goal: str, work_streams: list[str], verbose: bool = Fa
     return results
 
 
-async def run_orchestrator(goal: str, verbose: bool = True):
-    """Test the orchestrator's work stream identification."""
-    print("\n" + "=" * 50)
-    print("TASK BREAKDOWN AGENT - Iteration 2")
-    print("=" * 50)
+async def synthesize_plan(goal: str, worker_results: dict[str, str], verbose: bool = False) -> str | None:
+    """
+    Orchestrator Step 2: Combine worker outputs into a unified plan.
 
+    Takes the markdown outputs from all workers and synthesizes them into
+    a cohesive, ordered plan.
+    """
+    if verbose:
+        print("\n[ORCHESTRATOR] Synthesizing unified plan...")
+
+    # Format worker results for the prompt
+    results_text = "\n\n".join([
+        f"### {stream.title()} Work Stream\n{tasks}"
+        for stream, tasks in worker_results.items()
+    ])
+
+    result = None
+    async for message in query(
+        prompt=f"""Synthesize these work stream task lists into a unified project plan.
+
+Goal: {goal}
+
+Work Stream Results:
+{results_text}
+
+Create a cohesive plan that:
+1. Orders tasks logically (dependencies first)
+2. Identifies any cross-stream dependencies
+3. Groups related tasks together
+4. Provides a clear execution sequence
+
+Output a clean markdown document with the unified plan. Use checkboxes for tasks.""",
+        options=ClaudeAgentOptions()
+    ):
+        if isinstance(message, ResultMessage):
+            result = message.result
+
+    return result
+
+
+async def run_orchestrator(goal: str, verbose: bool = True) -> dict | None:
+    """
+    Full orchestrator-workers pipeline:
+    1. Orchestrator identifies work streams
+    2. Workers generate task lists
+    3. Orchestrator synthesizes unified plan
+    """
+    if verbose:
+        print("\n" + "=" * 50)
+        print("TASK BREAKDOWN AGENT")
+        print("=" * 50)
+
+    # Step 1: Identify work streams
     plan = await identify_work_streams(goal, verbose=verbose)
 
     if not plan:
-        print("[ERROR] Failed to identify work streams")
-        return None
+        if verbose:
+            print("[ERROR] Failed to identify work streams")
+        return {"success": False, "error": "Failed to identify work streams"}
 
-    print(f"\n[RESULT] Work streams: {plan.work_streams}")
+    if verbose:
+        print(f"\n[RESULT] Work streams: {plan.work_streams}")
 
+    # Step 2: Run workers for each stream
     worker_results = await run_all_workers(goal, plan.work_streams, verbose=verbose)
 
     if not worker_results:
-        print("[ERROR] No worker results")
-        return None
-    
+        if verbose:
+            print("[ERROR] No worker results")
+        return {"success": False, "error": "No worker results"}
+
+    # Step 3: Synthesize unified plan
+    final_plan = await synthesize_plan(goal, worker_results, verbose=verbose)
+
+    if not final_plan:
+        if verbose:
+            print("[ERROR] Synthesis failed")
+        return {"success": False, "error": "Synthesis failed"}
+
+    # Display final plan
     print("\n" + "=" * 50)
-    print("WORKER OUTPUTS")
+    print(f"TASK BREAKDOWN: {goal}")
     print("=" * 50)
-    for stream, tasks in worker_results.items():
-        print(f"\n### {stream.upper()}")
-        print(tasks)
-    
+    print(final_plan)
+
     return {
+        "success": True,
         "goal": goal,
         "work_streams": plan.work_streams,
-        "worker_results": worker_results,
+        "plan": final_plan
     }
 
 
+# =============================================================================
+# CLI Entry Point
+# =============================================================================
+
 def main():
-    import sys
-    goal = sys.argv[1] if len(sys.argv) > 1 else "Build a REST API for user management"
-    asyncio.run(run_orchestrator(goal))
+    """CLI entry point with argparse."""
+    parser = argparse.ArgumentParser(
+        description="Task Breakdown Agent - Break goals into actionable tasks",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python task_breakdown.py -g "Build a REST API for user management"
+  python task_breakdown.py -g "Migrate database to PostgreSQL" -v
+  python task_breakdown.py -g "Create onboarding guide" -o plan.md
+        """
+    )
+    parser.add_argument(
+        "-g", "--goal",
+        required=True,
+        help="The goal to break down into tasks"
+    )
+    parser.add_argument(
+        "-v", "--verbose",
+        action="store_true",
+        help="Show detailed orchestrator and worker output"
+    )
+    parser.add_argument(
+        "-o", "--output",
+        help="Save the plan to a markdown file"
+    )
+
+    args = parser.parse_args()
+
+    result = asyncio.run(run_orchestrator(args.goal, verbose=args.verbose))
+
+    if result and result.get("success"):
+        if args.output:
+            with open(args.output, "w") as f:
+                f.write(f"# Task Breakdown: {result['goal']}\n\n")
+                f.write(result["plan"])
+            print(f"\nPlan saved to: {args.output}")
+    else:
+        error = result.get("error", "Unknown error") if result else "Pipeline failed"
+        print(f"\nFailed: {error}")
 
 
 if __name__ == "__main__":
